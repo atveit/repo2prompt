@@ -1,0 +1,34 @@
+[package]
+name = "repo2prompt"
+version = "0.1.0"
+edition = "2021"
+authors = ["Amund Tveit"]
+description = "Extract repository content into XML, JSON, or plain text format"
+license = "MIT"
+repository = "https://github.com/user/repo2prompt"
+keywords = ["repository", "prompt", "code", "extraction", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+walkdir = "2.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+quick-xml = { version = "0.31", features = ["serialize"] }
+globset = "0.4"
+anyhow = "1.0"
+thiserror = "1.0"
+env_logger = "0.10"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[lib]
+name = "repo2prompt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "repo2prompt"
+path = "src/main.rs"

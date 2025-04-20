@@ -1,0 +1,536 @@
+<Repository><files><path>examples/programmatic_processing.rs</path><content>use std::collections::HashMap;
+use std::path::PathBuf;
+use repo2prompt::{Config, OutputFormat, process_repository, generate_output};
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    // Create configuration
+    let config = Config {
+        directory: PathBuf::from(&quot;.&quot;),
+        output_file: None,
+        format: OutputFormat::Text,
+        include_patterns: vec![&quot;*.rs&quot;.to_string(), &quot;*.md&quot;.to_string()],
+        exclude_patterns: vec![],
+        exclude_dir_patterns: vec![&quot;target&quot;.to_string()],
+        max_file_size: 1_000_000,
+        pretty_print: false,
+    };
+
+    // Process repository
+    println!(&quot;Processing repository...&quot;);
+    let files_map = process_repository(&amp;config)?;
+    
+    // Print statistics
+    println!(&quot;Found {} files&quot;, files_map.len());
+    let total_size: usize = files_map.iter().map(|(_, content)| content.len()).sum();
+    println!(&quot;Total content size: {} bytes&quot;, total_size);
+    
+    // Count lines of code in Rust files
+    let rust_files: HashMap&lt;String, String&gt; = files_map
+        .iter()
+        .filter(|(path, _)| path.ends_with(&quot;.rs&quot;))
+        .map(|(path, content)| (path.clone(), content.clone()))
+        .collect();
+    
+    let rust_loc: usize = rust_files
+        .iter()
+        .map(|(_, content)| content.lines().count())
+        .sum();
+    
+    println!(&quot;Rust files: {}, Lines of code: {}&quot;, rust_files.len(), rust_loc);
+    
+    // Generate output in text format
+    let output = generate_output(&amp;files_map, &amp;config)?;
+    
+    // Just print the first 200 characters to avoid flooding the console
+    println!(&quot;\nPreview of text output:&quot;);
+    println!(&quot;{}&quot;, &amp;output[..200.min(output.len())]);
+    println!(&quot;...&quot;);
+    
+    Ok(())
+}</content></files><files><path>examples/json_output.rs</path><content>use std::path::PathBuf;
+use repo2prompt::{Config, OutputFormat, run};
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    // Create a configuration for JSON output
+    let config = Config {
+        directory: PathBuf::from(&quot;.&quot;), 
+        output_file: None, // Output to stdout
+        format: OutputFormat::Json,
+        include_patterns: vec![&quot;*.md&quot;.to_string(), &quot;*.toml&quot;.to_string()],
+        exclude_patterns: vec![],
+        exclude_dir_patterns: vec![&quot;target&quot;.to_string()],
+        max_file_size: 500_000, // 500KB max
+        pretty_print: true,
+    };
+
+    // Run the extraction
+    println!(&quot;Extracting repository content to JSON...&quot;);
+    run(config)?;
+    
+    Ok(())
+}</content></files><files><path>src/lib.rs</path><content>use anyhow::{Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use quick_xml::se::to_string as xml_to_string;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use walkdir::{DirEntry, WalkDir};
+
+#[cfg(test)]
+mod tests;
+
+/// Supported output formats
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Xml,
+    Json,
+    Text,
+}
+
+/// Configuration for repository processing
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub directory: PathBuf,
+    pub output_file: Option&lt;PathBuf&gt;,
+    pub format: OutputFormat,
+    pub include_patterns: Vec&lt;String&gt;,
+    pub exclude_patterns: Vec&lt;String&gt;,
+    pub exclude_dir_patterns: Vec&lt;String&gt;,
+    pub max_file_size: u64,
+    pub pretty_print: bool,
+}
+
+impl Default for Config {
+    fn default() -&gt; Self {
+        Self {
+            directory: PathBuf::from(&quot;.&quot;),
+            output_file: None,
+            format: OutputFormat::Xml,
+            include_patterns: vec![
+                &quot;*.py&quot;.to_string(),
+                &quot;*.js&quot;.to_string(),
+                &quot;*.rs&quot;.to_string(),
+                &quot;*.md&quot;.to_string(),
+                &quot;*.txt&quot;.to_string(),
+                &quot;*.ini&quot;.to_string(),
+            ],
+            exclude_patterns: Vec::new(),
+            exclude_dir_patterns: Vec::new(),
+            max_file_size: 1_000_000, // 1MB
+            pretty_print: false,
+        }
+    }
+}
+
+/// Repository file with path and content
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoFile {
+    pub path: String,
+    pub content: String,
+}
+
+/// Repository representation for serialization
+#[derive(Debug, Serialize)]
+struct Repository {
+    files: Vec&lt;RepoFile&gt;,
+}
+
+/// Errors that can occur during repository processing
+#[derive(Error, Debug)]
+pub enum RepoError {
+    #[error(&quot;IO error: {0}&quot;)]
+    Io(#[from] std::io::Error),
+    
+    #[error(&quot;Failed to process directory: {0}&quot;)]
+    DirectoryProcessing(String),
+    
+    #[error(&quot;Failed to serialize output: {0}&quot;)]
+    Serialization(String),
+}
+
+/// Process a repository and extract file contents based on configuration
+pub fn process_repository(config: &amp;Config) -&gt; Result&lt;HashMap&lt;String, String&gt;&gt; {
+    let mut files_map = HashMap::new();
+    let root_path = config.directory.canonicalize()?;
+    
+    // Build include glob set
+    let include_glob_set = build_glob_set(&amp;config.include_patterns)?;
+    
+    // Build exclude glob set
+    let exclude_glob_set = build_glob_set(&amp;config.exclude_patterns)?;
+    
+    // Build exclude dir glob set
+    let exclude_dir_glob_set = build_glob_set(&amp;config.exclude_dir_patterns)?;
+    
+    // Default directory excludes
+    let default_dir_excludes = [
+        &quot;.git&quot;, &quot;target&quot;, &quot;node_modules&quot;, &quot;__pycache__&quot;, 
+        &quot;venv&quot;, &quot;.venv&quot;, &quot;env&quot;, &quot;.env&quot;,
+    ];
+    
+    // Walk directory
+    for entry in WalkDir::new(&amp;root_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| is_directory_included(e, &amp;exclude_dir_glob_set, &amp;default_dir_excludes))
+        .filter_map(|e| e.ok())
+    {
+        // Skip directories
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        
+        let path = entry.path();
+        
+        // Check file size
+        if let Ok(metadata) = path.metadata() {
+            if metadata.len() &gt; config.max_file_size {
+                log::debug!(&quot;Skipping large file: {:?}&quot;, path);
+                continue;
+            }
+        }
+        
+        // Check if file matches include/exclude patterns
+        if !is_file_included(path, &amp;include_glob_set, &amp;exclude_glob_set) {
+            continue;
+        }
+        
+        // Read file content
+        match fs::read_to_string(path) {
+            Ok(content) =&gt; {
+                // Get relative path from root
+                if let Ok(rel_path) = path.strip_prefix(&amp;root_path) {
+                    let rel_path_str = rel_path.to_string_lossy().to_string();
+                    files_map.insert(rel_path_str, content);
+                }
+            }
+            Err(e) =&gt; {
+                log::warn!(&quot;Failed to read file {:?}: {}&quot;, path, e);
+            }
+        }
+    }
+    
+    Ok(files_map)
+}
+
+/// Check if a directory should be included in processing
+fn is_directory_included(
+    entry: &amp;DirEntry,
+    exclude_dir_glob_set: &amp;GlobSet,
+    default_excludes: &amp;[&amp;str],
+) -&gt; bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
+    
+    let path = entry.path();
+    let dir_name = match path.file_name() {
+        Some(name) =&gt; name.to_string_lossy(),
+        None =&gt; return true,
+    };
+    
+    // Check default excludes
+    if default_excludes.iter().any(|&amp;ex| dir_name == ex) {
+        return false;
+    }
+    
+    // Check glob patterns
+    !exclude_dir_glob_set.is_match(path)
+}
+
+/// Check if a file should be included based on glob patterns
+fn is_file_included(
+    path: &amp;Path,
+    include_glob_set: &amp;GlobSet,
+    exclude_glob_set: &amp;GlobSet,
+) -&gt; bool {
+    // Must match include pattern
+    if !include_glob_set.is_match(path) {
+        return false;
+    }
+    
+    // Must not match exclude pattern
+    !exclude_glob_set.is_match(path)
+}
+
+/// Build a GlobSet from a list of patterns
+fn build_glob_set(patterns: &amp;[String]) -&gt; Result&lt;GlobSet&gt; {
+    let mut builder = GlobSetBuilder::new();
+    
+    for pattern in patterns {
+        let glob = Glob::new(pattern)
+            .context(format!(&quot;Invalid glob pattern: {}&quot;, pattern))?;
+        builder.add(glob);
+    }
+    
+    builder.build().context(&quot;Failed to build glob set&quot;)
+}
+
+/// Format files as XML
+pub fn format_as_xml(
+    files_map: &amp;HashMap&lt;String, String&gt;,
+    _pretty: bool, // Unused but kept for API consistency
+) -&gt; Result&lt;String&gt; {
+    let files = files_map_to_vec(files_map);
+    let repo = Repository { files };
+    
+    // Quick-xml doesn&apos;t support pretty printing in its simple API
+    // For now, we&apos;ll just use the basic XML output
+    xml_to_string(&amp;repo)
+        .context(&quot;Failed to serialize to XML&quot;)
+}
+
+/// Format files as JSON
+pub fn format_as_json(
+    files_map: &amp;HashMap&lt;String, String&gt;,
+    pretty: bool,
+) -&gt; Result&lt;String&gt; {
+    let files = files_map_to_vec(files_map);
+    let repo = Repository { files };
+    
+    if pretty {
+        serde_json::to_string_pretty(&amp;repo)
+    } else {
+        serde_json::to_string(&amp;repo)
+    }
+    .context(&quot;Failed to serialize to JSON&quot;)
+}
+
+/// Format files as plain text
+pub fn format_as_text(files_map: &amp;HashMap&lt;String, String&gt;) -&gt; Result&lt;String&gt; {
+    let mut output = String::new();
+    
+    for (path, content) in files_map {
+        output.push_str(&amp;format!(&quot;# {}\n&quot;, path));
+        output.push_str(content);
+        output.push_str(&quot;\n\n&quot;);
+    }
+    
+    Ok(output)
+}
+
+/// Convert files map to vector of RepoFile
+fn files_map_to_vec(files_map: &amp;HashMap&lt;String, String&gt;) -&gt; Vec&lt;RepoFile&gt; {
+    files_map
+        .iter()
+        .map(|(path, content)| RepoFile {
+            path: path.clone(),
+            content: content.clone(),
+        })
+        .collect()
+}
+
+/// Generate output in the specified format
+pub fn generate_output(files_map: &amp;HashMap&lt;String, String&gt;, config: &amp;Config) -&gt; Result&lt;String&gt; {
+    match config.format {
+        OutputFormat::Xml =&gt; format_as_xml(files_map, config.pretty_print),
+        OutputFormat::Json =&gt; format_as_json(files_map, config.pretty_print),
+        OutputFormat::Text =&gt; format_as_text(files_map),
+    }
+}
+
+/// Write output to file or stdout
+pub fn write_output(output: &amp;str, config: &amp;Config) -&gt; Result&lt;()&gt; {
+    match &amp;config.output_file {
+        Some(path) =&gt; {
+            fs::write(path, output).context(&quot;Failed to write output to file&quot;)?;
+            log::info!(&quot;Output written to {:?}&quot;, path);
+        }
+        None =&gt; {
+            std::io::stdout()
+                .write_all(output.as_bytes())
+                .context(&quot;Failed to write output to stdout&quot;)?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Run the repository processing and generate output
+pub fn run(config: Config) -&gt; Result&lt;()&gt; {
+    // Process repository
+    let files_map = process_repository(&amp;config)?;
+    log::info!(&quot;Processed {} files&quot;, files_map.len());
+    
+    // Generate output
+    let output = generate_output(&amp;files_map, &amp;config)?;
+    
+    // Write output
+    write_output(&amp;output, &amp;config)?;
+    
+    Ok(())
+}</content></files><files><path>src/main.rs</path><content>use anyhow::Result;
+use clap::{Parser, ValueEnum};
+use repo2prompt::{run, Config, OutputFormat};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Format {
+    Xml,
+    Json,
+    Text,
+}
+
+impl From&lt;Format&gt; for OutputFormat {
+    fn from(format: Format) -&gt; Self {
+        match format {
+            Format::Xml =&gt; OutputFormat::Xml,
+            Format::Json =&gt; OutputFormat::Json,
+            Format::Text =&gt; OutputFormat::Text,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = &quot;repo2prompt&quot;,
+    about = &quot;Extract repository content into XML, JSON, or text format&quot;,
+    version
+)]
+struct Cli {
+    /// Root directory to process (default: current directory)
+    #[arg(short, long, default_value = &quot;.&quot;)]
+    directory: PathBuf,
+    
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    output: Option&lt;PathBuf&gt;,
+    
+    /// Output format (default: xml)
+    #[arg(short, long, value_enum, default_value_t = Format::Xml)]
+    format: Format,
+    
+    /// File patterns to include (can specify multiple, e.g., &apos;*.py&apos;, &apos;*.js&apos;)
+    #[arg(short, long)]
+    include: Vec&lt;String&gt;,
+    
+    /// File patterns to exclude (can specify multiple)
+    #[arg(short, long)]
+    exclude: Vec&lt;String&gt;,
+    
+    /// Directory patterns to exclude (can specify multiple)
+    #[arg(long)]
+    exclude_dirs: Vec&lt;String&gt;,
+    
+    /// Maximum file size in bytes (default: 1MB)
+    #[arg(long, default_value_t = 1_000_000)]
+    max_size: u64,
+    
+    /// Pretty-print output (for XML and JSON)
+    #[arg(long)]
+    pretty: bool,
+    
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+fn main() -&gt; Result&lt;()&gt; {
+    // Parse command line arguments
+    let args = Cli::parse();
+    
+    // Setup logging
+    if args.verbose {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&quot;info&quot;)).init();
+    } else {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&quot;warn&quot;)).init();
+    }
+    
+    // Create configuration
+    let config = Config {
+        directory: args.directory,
+        output_file: args.output,
+        format: args.format.into(),
+        include_patterns: if args.include.is_empty() {
+            vec![
+                &quot;*.py&quot;.to_string(),
+                &quot;*.js&quot;.to_string(),
+                &quot;*.rs&quot;.to_string(), 
+                &quot;*.md&quot;.to_string(),
+                &quot;*.txt&quot;.to_string(),
+                &quot;*.ini&quot;.to_string(),
+            ]
+        } else {
+            args.include
+        },
+        exclude_patterns: args.exclude,
+        exclude_dir_patterns: args.exclude_dirs,
+        max_file_size: args.max_size,
+        pretty_print: args.pretty,
+    };
+    
+    // Run program
+    run(config)
+}</content></files><files><path>examples/custom_filtering.rs</path><content>use std::path::PathBuf;
+use repo2prompt::{Config, OutputFormat, process_repository, generate_output, write_output};
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    // Create configuration with specific file filters
+    let config = Config {
+        directory: PathBuf::from(&quot;.&quot;),
+        output_file: Some(PathBuf::from(&quot;filtered_repo.json&quot;)),
+        format: OutputFormat::Json,
+        include_patterns: vec![
+            // Include only source code files
+            &quot;*.rs&quot;.to_string(),
+            &quot;*.toml&quot;.to_string(),
+            &quot;*.md&quot;.to_string(),
+        ],
+        exclude_patterns: vec![
+            // Exclude test files
+            &quot;*test*&quot;.to_string(),
+            &quot;*spec*&quot;.to_string(),
+        ],
+        exclude_dir_patterns: vec![
+            // Exclude build/dependency directories
+            &quot;target&quot;.to_string(),
+            &quot;.git&quot;.to_string(),
+        ],
+        max_file_size: 100_000, // 100KB max
+        pretty_print: true,
+    };
+
+    // Process repository
+    let mut files_map = process_repository(&amp;config)?;
+    println!(&quot;Initial processing found {} files&quot;, files_map.len());
+    
+    // Additional programmatic filtering
+    // Remove any file containing &quot;TODO&quot; or &quot;FIXME&quot; comments
+    files_map.retain(|_, content| {
+        !content.contains(&quot;TODO&quot;) &amp;&amp; !content.contains(&quot;FIXME&quot;)
+    });
+    
+    println!(&quot;After additional filtering: {} files&quot;, files_map.len());
+    
+    // Generate and write output
+    let output = generate_output(&amp;files_map, &amp;config)?;
+    write_output(&amp;output, &amp;config)?;
+    
+    println!(&quot;Filtered repository content written to filtered_repo.json&quot;);
+    
+    Ok(())
+}</content></files><files><path>examples/basic_usage.rs</path><content>use std::path::PathBuf;
+use repo2prompt::{Config, OutputFormat, run};
+
+fn main() -&gt; anyhow::Result&lt;()&gt; {
+    // Create a basic configuration
+    let config = Config {
+        directory: PathBuf::from(&quot;.&quot;),
+        output_file: Some(PathBuf::from(&quot;output.xml&quot;)),
+        format: OutputFormat::Xml,
+        include_patterns: vec![&quot;*.rs&quot;.to_string()],
+        exclude_patterns: vec![&quot;*test*&quot;.to_string()], 
+        exclude_dir_patterns: vec![],
+        max_file_size: 1_000_000,
+        pretty_print: true,
+    };
+
+    // Run the extraction
+    run(config)?;
+    println!(&quot;Repository content extracted to output.xml&quot;);
+    
+    Ok(())
+}</content></files></Repository>
