@@ -21,7 +21,7 @@ cargo install repo2prompt
 ### From source
 
 ```bash
-git clone https://github.com/user/repo2prompt.git
+git clone https://github.com/atveit/repo2prompt.git
 cd repo2prompt
 cargo install --path .
 ```
