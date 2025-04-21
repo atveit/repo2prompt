@@ -1,6 +1,6 @@
 [package]
 name = "repo2prompt"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Amund Tveit"]
 description = "Extract repository content into XML, JSON, or plain text format"
